@@ -1,0 +1,26 @@
+# Campus monitoring gateway: public UDP port lease API (single instance).
+#
+# Demo configuration: the pool is a SINGLE port so two peers visibly share
+# one public port, and the 5 s isolation window is easy to observe.
+services:
+  port-allocator:
+    build: .
+    image: campus-gateway-port-allocator:latest
+    container_name: campus-gateway-port-allocator
+    ports:
+      - "8080:8080"
+    environment:
+      # Public IPv4 of the gateway that forwards probe UDP polling.
+      PUBLIC_IPV4: "203.0.113.10"
+      # One-port pool for the demo. In production set a real contiguous range.
+      POOL_START: "40000"
+      POOL_END: "40000"
+      LEASE_TTL_SECONDS: "30"
+      ISOLATION_TTL_SECONDS: "5"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s

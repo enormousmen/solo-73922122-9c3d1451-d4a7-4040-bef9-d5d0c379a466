@@ -1,0 +1,7 @@
+# Local Python environment (used only for running tests outside Docker).
+.deps/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
