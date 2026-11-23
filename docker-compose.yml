@@ -1,22 +1,39 @@
-# Campus monitoring gateway: public UDP port lease API (single instance).
+# Campus monitoring gateway: public UDP port leases + real UDP forwarding.
 #
-# Demo configuration: the pool is a SINGLE port so two peers visibly share
-# one public port, and the 5 s isolation window is easy to observe.
+# Demo configuration: ONE public UDP port so two peers visibly share it, and
+# the 5 s isolation window is easy to observe.
+#
+# Networking choice: host mode. The whole point of this service is to send
+# datagrams *from* the leased public source port and receive replies on that
+# same port, so the gateway, the probes and the peers must share one network
+# namespace. With bridge + `ports:` the source port would be rewritten/NATed
+# and replies from a loopback peer would never reach the container.
+#
+#   docker compose up --build
+#   python3 scripts/demo_udp.py        # on the same host
+#
+# The app itself does not require host mode: the demo simply runs its echo
+# peers on 127.0.0.1, which must be the gateway's localhost as well. For a
+# bridge deployment, publish "40000:40000/udp" and point probes/peers at
+# reachable non-loopback addresses instead.
 services:
-  port-allocator:
+  gateway:
     build: .
     image: campus-gateway-port-allocator:latest
-    container_name: campus-gateway-port-allocator
-    ports:
-      - "8080:8080"
+    container_name: campus-gateway
+    network_mode: host
     environment:
-      # Public IPv4 of the gateway that forwards probe UDP polling.
+      # Public IPv4 of the gateway, echoed in lease responses.
       PUBLIC_IPV4: "203.0.113.10"
-      # One-port pool for the demo. In production set a real contiguous range.
+      # One-port pool for the demo. Production: set the full contiguous range.
       POOL_START: "40000"
       POOL_END: "40000"
       LEASE_TTL_SECONDS: "30"
       ISOLATION_TTL_SECONDS: "5"
+      # Real UDP forwarding: leases are only issued after the port is bound.
+      UDP_FORWARDING_ENABLED: "true"
+      UDP_BIND_HOST: "0.0.0.0"
+      SWEEP_INTERVAL_SECONDS: "0.5"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status == 200 else 1)"]

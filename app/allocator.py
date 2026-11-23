@@ -27,19 +27,36 @@ Data model per peer (lazy, created on first use)
               the deadline passes.
 * two heaps give O(log n) expiry processing instead of periodic sweeps.
 
+UDP forwarding hook
+-------------------
+When a :class:`~app.forwarder.UdpForwarder` is attached, a public port must be
+bound before its lease is committed (``prepare_port``) and the lease is
+attached to the port's socket (``add_lease``). A bind failure rolls the pool
+slot back and raises :class:`PublicPortUnavailable`, leaving no lease, no held
+port and no quarantine entry. Return and expiry both detach the lease; the
+forwarder closes the socket when the last lease on that port ends. Because the
+business state is otherwise lazy, ``sweep_expired`` is invoked by a small timer
+in the app so expiry alone still releases sockets.
+
 All operations are O(log n) in the number of entries a peer actually uses;
 there is no O(pool size) allocation step anywhere.
 """
 
 from __future__ import annotations
 
+import contextlib
 import heapq
 import itertools
+import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
+
+from .forwarder import UdpForwardingError, UdpForwarder
+
+logger = logging.getLogger(__name__)
 
 
 class LeaseNotFound(KeyError):
@@ -48,6 +65,14 @@ class LeaseNotFound(KeyError):
 
 class PoolExhausted(RuntimeError):
     """Raised when the requesting peer already holds/quarantines every port."""
+
+
+class PublicPortUnavailable(RuntimeError):
+    """The public UDP port could not be bound, so no lease was issued.
+
+    The allocator has already rolled back the pool slot; raising this leaves
+    no lease, no held port and no quarantine entry behind.
+    """
 
 
 class FreeIntervalSet:
@@ -167,6 +192,7 @@ class PortAllocator:
         *,
         clock=time.monotonic,
         wall_clock=time.time,
+        forwarder: Optional[UdpForwarder] = None,
     ) -> None:
         if pool_start > pool_end:
             raise ValueError("pool_start must not be greater than pool_end")
@@ -180,6 +206,8 @@ class PortAllocator:
         self.isolation_ttl = float(isolation_ttl_seconds)
         self._clock = clock
         self._wall_clock = wall_clock
+        # When set, a public port is only leased after its UDP socket bound.
+        self.forwarder = forwarder
         self._peers: dict[tuple[str, int], PeerState] = {}
         # public_port -> set of peer keys currently holding a valid lease on
         # it. Drives the "same port to different peers" sharing rule.
@@ -188,10 +216,46 @@ class PortAllocator:
         # and an old id can never resolve to a newer lease on the same port.
         self._lease_owner: dict[str, tuple[str, int]] = {}
         self._lock = threading.RLock()
+        # Ports whose last lease ended while the lock was held. The forwarder
+        # close is executed *after* the lock is released: closing waits for the
+        # selector thread, which itself calls back into lookup() and needs this
+        # lock -- waiting while holding it would deadlock.
+        self._pending_release: list[tuple[int, str]] = []
         # Monotonic sequence makes lease ids unique even if uuid4 collided.
         self._id_seq = itertools.count(1)
 
     # ------------------------------------------------------------------ utils
+
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold the state lock, then hand finished sockets to the forwarder."""
+        try:
+            with self._lock:
+                yield
+        finally:
+            # Always drain, even when the body raised: a pool-exhausted or
+            # not-found path may already have expired leases.
+            self._flush_pending_releases()
+
+    def _flush_pending_releases(self) -> None:
+        if self.forwarder is None:
+            return
+        while True:
+            with self._lock:
+                if not self._pending_release:
+                    return
+                port, lease_id = self._pending_release.pop()
+            try:
+                self.forwarder.remove_lease(port, lease_id)
+            except Exception:  # pragma: no cover - keep the lease store sane
+                logger.exception(
+                    "failed to detach lease %s from public port %s", lease_id, port
+                )
+
+    def _queue_release(self, port: int, lease_id: str) -> None:
+        """Detach a lease from its socket (deferred until the lock is free)."""
+        if self.forwarder is not None:
+            self._pending_release.append((port, lease_id))
 
     def _now(self) -> float:
         return self._clock()
@@ -217,27 +281,7 @@ class PortAllocator:
         background timer, so no lease can disappear mid-request.
         """
         # 1. Expired leases -> quarantine the (port, peer) pair.
-        while state.lease_expiry_heap and state.lease_expiry_heap[0][0] <= now:
-            deadline, lease_id = heapq.heappop(state.lease_expiry_heap)
-            lease = state.leases.get(lease_id)
-            if lease is None:
-                continue  # already returned.
-            if lease.expires_at != deadline:
-                continue  # stale entry left behind by a renewal.
-            state.leases.pop(lease_id)
-            self._lease_owner.pop(lease_id, None)
-            port = lease.public_port
-            state.held.discard(port)
-            users = self._port_users.get(port)
-            if users is not None:
-                users.discard(state.peer_key)
-                if not users:
-                    del self._port_users[port]
-            until = now + self.isolation_ttl
-            old = state.quarantine_until.get(port)
-            if old is None or until > old:
-                state.quarantine_until[port] = until
-                heapq.heappush(state.quarantine_heap, (until, port))
+        self._expire_due(state, now)
 
         # 2. Finished quarantine -> port becomes allocatable to this peer
         #    again. Only this (port, peer) pair is affected; other peers keep
@@ -266,7 +310,7 @@ class PortAllocator:
         valid return the original lease unchanged (its 30 s window is NOT
         reset here -- that is what renew is for).
         """
-        with self._lock:
+        with self._locked():
             now = self._now()
             state = self._peer(peer_ipv4, peer_port)
             self._process_expirations(state, now)
@@ -304,23 +348,83 @@ class PortAllocator:
 
             public_port = state.free.pop_any()
             lease_id = self._new_lease_id()
-            lease = Lease(
-                lease_id=lease_id,
+            return self._commit_lease(
+                state=state,
+                now=now,
                 public_port=public_port,
+                lease_id=lease_id,
                 probe_ipv4=probe_ipv4,
                 probe_port=probe_port,
                 peer_ipv4=peer_ipv4,
                 peer_port=peer_port,
-                created_at=now,
-                expires_at=now + self.lease_ttl,
-                expires_at_wall=self._wall_clock() + self.lease_ttl,
-            )
-            state.leases[lease_id] = lease
-            state.held.add(public_port)
-            heapq.heappush(state.lease_expiry_heap, (lease.expires_at, lease_id))
-            self._lease_owner[lease_id] = state.peer_key
-            self._port_users.setdefault(public_port, set()).add(state.peer_key)
-            return lease, False
+            ), False
+
+    def _commit_lease(
+        self,
+        *,
+        state: PeerState,
+        now: float,
+        public_port: int,
+        lease_id: str,
+        probe_ipv4: str,
+        probe_port: int,
+        peer_ipv4: str,
+        peer_port: int,
+    ) -> Lease:
+        """Bind the public port, then commit the lease; roll back on failure.
+
+        With UDP forwarding enabled, a lease is only handed out after the
+        socket bound. If binding raises, the free-set split is undone and
+        nothing else was written yet -- no lease, no held slot, no quarantine.
+        """
+        if self.forwarder is not None:
+            try:
+                self.forwarder.prepare_port(public_port)
+            except UdpForwardingError as exc:
+                state.free.add(public_port, public_port)
+                raise PublicPortUnavailable(
+                    f"public port {public_port} is unavailable: {exc}"
+                ) from exc
+
+        lease = Lease(
+            lease_id=lease_id,
+            public_port=public_port,
+            probe_ipv4=probe_ipv4,
+            probe_port=probe_port,
+            peer_ipv4=peer_ipv4,
+            peer_port=peer_port,
+            created_at=now,
+            expires_at=now + self.lease_ttl,
+            expires_at_wall=self._wall_clock() + self.lease_ttl,
+        )
+        state.leases[lease_id] = lease
+        state.held.add(public_port)
+        heapq.heappush(state.lease_expiry_heap, (lease.expires_at, lease_id))
+        self._lease_owner[lease_id] = state.peer_key
+        self._port_users.setdefault(public_port, set()).add(state.peer_key)
+        if self.forwarder is not None:
+            try:
+                self.forwarder.add_lease(public_port, lease_id)
+            except UdpForwardingError as exc:
+                # Extremely defensive: undo the in-memory commit as well.
+                self._uncommit_lease(state, lease)
+                raise PublicPortUnavailable(
+                    f"public port {public_port} is unavailable: {exc}"
+                ) from exc
+        return lease
+
+    def _uncommit_lease(self, state: PeerState, lease: Lease) -> None:
+        state.leases.pop(lease.lease_id, None)
+        state.held.discard(lease.public_port)
+        self._lease_owner.pop(lease.lease_id, None)
+        users = self._port_users.get(lease.public_port)
+        if users is not None:
+            users.discard(state.peer_key)
+            if not users:
+                del self._port_users[lease.public_port]
+        state.free.add(lease.public_port, lease.public_port)
+        if self.forwarder is not None:
+            self.forwarder.release_port_if_unused(lease.public_port)
 
     def renew(self, lease_id: str) -> Lease:
         """Reset a valid lease's lifetime to a full 30 s.
@@ -328,7 +432,7 @@ class PortAllocator:
         Unknown / returned / expired ids raise :class:`LeaseNotFound`; an old
         id therefore can never touch a new lease that reused the same port.
         """
-        with self._lock:
+        with self._locked():
             now = self._now()
             owner = self._lease_owner.get(lease_id)
             if owner is None:
@@ -344,9 +448,29 @@ class PortAllocator:
             heapq.heappush(state.lease_expiry_heap, (lease.expires_at, lease_id))
             return lease
 
+    def _expire_lease(self, state: PeerState, lease: Lease, now: float) -> None:
+        """Remove an expired lease, drop its socket, quarantine (port, peer)."""
+        state.leases.pop(lease.lease_id, None)
+        self._lease_owner.pop(lease.lease_id, None)
+        port = lease.public_port
+        state.held.discard(port)
+        users = self._port_users.get(port)
+        if users is not None:
+            users.discard(state.peer_key)
+            if not users:
+                del self._port_users[port]
+        # Last lease on this public port -> the socket is closed and its
+        # receive thread stops without needing another request.
+        self._queue_release(port, lease.lease_id)
+        until = now + self.isolation_ttl
+        old = state.quarantine_until.get(port)
+        if old is None or until > old:
+            state.quarantine_until[port] = until
+            heapq.heappush(state.quarantine_heap, (until, port))
+
     def release(self, lease_id: str) -> Lease:
         """Return a valid lease; only its (port, peer) pair is quarantined."""
-        with self._lock:
+        with self._locked():
             now = self._now()
             owner = self._lease_owner.get(lease_id)
             if owner is None:
@@ -367,10 +491,27 @@ class PortAllocator:
                 users.discard(state.peer_key)
                 if not users:
                     del self._port_users[port]
+            # If another peer still holds this port its lease stays attached
+            # and the socket is kept; only the last lease closes it.
+            self._queue_release(port, lease_id)
             until = now + self.isolation_ttl
             state.quarantine_until[port] = until
             heapq.heappush(state.quarantine_heap, (until, port))
             return lease
+
+    def get_valid_lease(self, lease_id: str) -> Optional[Lease]:
+        """Return a lease if it is still valid, otherwise ``None``.
+
+        Used by the send API: an unknown, released or expired id must not be
+        able to push a datagram out of a public port.
+        """
+        with self._locked():
+            owner = self._lease_owner.get(lease_id)
+            if owner is None:
+                return None
+            state = self._peers[owner]
+            self._process_expirations(state, self._now())
+            return state.leases.get(lease_id)
 
     def lookup(
         self, public_port: int, peer_ipv4: str, peer_port: int
@@ -381,7 +522,7 @@ class PortAllocator:
         mapping -- including while it is inside the 5 s quarantine window, so
         late replies during isolation are reported as unmapped.
         """
-        with self._lock:
+        with self._locked():
             state = self._peers.get((peer_ipv4, peer_port))
             if state is None:
                 return None
@@ -394,11 +535,40 @@ class PortAllocator:
                     return lease
             return None
 
+    def sweep_expired(self) -> list[tuple[int, str]]:
+        """Process expirations for every peer without an inbound request.
+
+        Called periodically by the app so that when the last lease on a public
+        port expires the UDP socket is closed and its receive thread stops even
+        if nothing else ever touches the service. Returns the (port, lease id)
+        pairs that actually expired, for logging.
+        """
+        expired: list[tuple[int, str]] = []
+        with self._locked():
+            now = self._now()
+            for state in self._peers.values():
+                expired.extend(self._expire_due(state, now))
+        return expired
+
+    def _expire_due(self, state: PeerState, now: float) -> list[tuple[int, str]]:
+        """Pop due lease heap entries, forwarding each real expiry."""
+        expired: list[tuple[int, str]] = []
+        while state.lease_expiry_heap and state.lease_expiry_heap[0][0] <= now:
+            deadline, lease_id = heapq.heappop(state.lease_expiry_heap)
+            lease = state.leases.get(lease_id)
+            if lease is None:
+                continue  # already returned.
+            if lease.expires_at != deadline:
+                continue  # stale entry left behind by a renewal.
+            self._expire_lease(state, lease, now)
+            expired.append((lease.public_port, lease_id))
+        return expired
+
     # ------------------------------------------------------------- diagnostics
 
     def snapshot(self) -> dict:
         """Debug view of the whole store (used by GET /debug/state)."""
-        with self._lock:
+        with self._locked():
             now = self._now()
             peers_out: dict[str, dict] = {}
             for (peer_ip, peer_port), state in self._peers.items():
@@ -416,6 +586,9 @@ class PortAllocator:
                 "pool": {"start": self.pool_start, "end": self.pool_end},
                 "lease_ttl_seconds": self.lease_ttl,
                 "isolation_ttl_seconds": self.isolation_ttl,
+                "udp_forwarding": (
+                    self.forwarder.snapshot() if self.forwarder is not None else None
+                ),
                 "port_users": {
                     str(port): sorted(f"{ip}:{p}" for ip, p in users)
                     for port, users in sorted(self._port_users.items())

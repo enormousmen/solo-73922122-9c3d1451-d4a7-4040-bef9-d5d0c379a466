@@ -1,0 +1,3 @@
+# Test-only dependencies (FastAPI TestClient needs an HTTP client).
+-r requirements.txt
+httpx==0.28.1

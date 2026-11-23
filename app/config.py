@@ -16,6 +16,9 @@ DEFAULT_POOL_START = 40000
 DEFAULT_POOL_END = 40000
 DEFAULT_LEASE_TTL_SECONDS = 30.0
 DEFAULT_ISOLATION_TTL_SECONDS = 5.0
+DEFAULT_UDP_FORWARDING_ENABLED = False
+DEFAULT_UDP_BIND_HOST = "0.0.0.0"
+DEFAULT_SWEEP_INTERVAL_SECONDS = 0.5
 
 MIN_PORT = 1024
 MAX_PORT = 65535
@@ -45,6 +48,18 @@ def _env_float(name: str, default: float) -> float:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be a boolean (true/false), got {raw!r}")
+
+
 @dataclass(frozen=True)
 class Settings:
     public_ipv4: str
@@ -52,6 +67,9 @@ class Settings:
     pool_end: int
     lease_ttl_seconds: float
     isolation_ttl_seconds: float
+    udp_forwarding_enabled: bool = DEFAULT_UDP_FORWARDING_ENABLED
+    udp_bind_host: str = DEFAULT_UDP_BIND_HOST
+    sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS
 
     @property
     def pool_size(self) -> int:
@@ -86,10 +104,23 @@ class Settings:
                 f"ISOLATION_TTL_SECONDS must not be negative, got {isolation_ttl}"
             )
 
+        forward = _env_bool("UDP_FORWARDING_ENABLED", DEFAULT_UDP_FORWARDING_ENABLED)
+        bind_host = os.environ.get("UDP_BIND_HOST", DEFAULT_UDP_BIND_HOST).strip()
+        if not bind_host:
+            raise ConfigError("UDP_BIND_HOST must not be empty")
+        sweep_interval = _env_float("SWEEP_INTERVAL_SECONDS", DEFAULT_SWEEP_INTERVAL_SECONDS)
+        if sweep_interval <= 0:
+            raise ConfigError(
+                f"SWEEP_INTERVAL_SECONDS must be positive, got {sweep_interval}"
+            )
+
         return cls(
             public_ipv4=public_ipv4,
             pool_start=pool_start,
             pool_end=pool_end,
             lease_ttl_seconds=lease_ttl,
             isolation_ttl_seconds=isolation_ttl,
+            udp_forwarding_enabled=forward,
+            udp_bind_host=bind_host,
+            sweep_interval_seconds=sweep_interval,
         )
